@@ -16,6 +16,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read    # for actions/checkout
+      issues: write     # for creating alert issues on failure
     steps:
       - uses: actions/checkout@v4
 
