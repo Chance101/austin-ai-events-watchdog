@@ -36,6 +36,9 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ALERT_THRESHOLD_EVENTS: ${{ secrets.ALERT_THRESHOLD_EVENTS || '5' }}
           WATCHDOG_DISABLED: ${{ secrets.WATCHDOG_DISABLED || '0' }}
+          # Comma-separated list of city slugs to check. Each must have a Luma
+          # reference URL configured in scripts/coverage.js (CITY_LUMA_URLS).
+          WATCHDOG_CITIES: ${{ secrets.WATCHDOG_CITIES || 'austin,sf' }}
         run: npm start
 
       - name: Create GH issue on alert

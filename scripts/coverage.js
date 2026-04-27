@@ -16,7 +16,15 @@ import { createClient } from '@supabase/supabase-js';
 import * as cheerio from 'cheerio';
 
 const LOOKAHEAD_DAYS = 14;
-const LUMA_AUSTIN_URL = 'https://luma.com/austin';
+
+// Per-city Luma reference URL. The watchdog compares our DB against this
+// public Luma calendar to detect coverage drops. For SF, luma.com/sf is too
+// noisy (matches Austin's experience with luma.com/austin); luma.com/genai-sf
+// (Bond AI, 120k+ members) is the cleanest ground-truth comparison.
+const CITY_LUMA_URLS = {
+  austin: 'https://luma.com/austin',
+  sf: 'https://luma.com/genai-sf',
+};
 
 // Rough AI-relevance filter. Not perfect — the main system's validator
 // is more sophisticated — but good enough for a coverage sanity check.
@@ -38,12 +46,12 @@ function isAIRelated(title, description = '') {
 }
 
 /**
- * Fetch luma.com/austin and extract events from __NEXT_DATA__.
+ * Fetch a city's reference Luma calendar and extract events from __NEXT_DATA__.
  * Independent copy of the relevant extraction logic — NOT an import
  * from the main repo (that would defeat the isolation purpose).
  */
-async function fetchLumaAustinEvents() {
-  const response = await fetch(LUMA_AUSTIN_URL, {
+async function fetchLumaEvents(lumaUrl) {
+  const response = await fetch(lumaUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -102,9 +110,9 @@ async function fetchLumaAustinEvents() {
 }
 
 /**
- * Fetch our Supabase events in the lookahead window.
+ * Fetch our Supabase events in the lookahead window for a specific city.
  */
-async function fetchOurEvents() {
+async function fetchOurEvents(city) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
   if (!supabaseUrl || !anonKey) {
@@ -118,6 +126,7 @@ async function fetchOurEvents() {
   const { data, error } = await supabase
     .from('events')
     .select('id, title, start_time, url')
+    .eq('city', city)
     .is('deleted_at', null)
     .gte('start_time', now.toISOString())
     .lte('start_time', horizon.toISOString());
@@ -157,26 +166,41 @@ function eventsMatch(lumaEvt, ourEvt) {
   return false;
 }
 
-export async function checkCoverage() {
+export async function checkCoverage(city = 'austin') {
+  const lumaUrl = CITY_LUMA_URLS[city];
+  if (!lumaUrl) {
+    return {
+      status: 'error',
+      city,
+      error: `No Luma reference URL configured for city=${city}`,
+      events_on_luma: null,
+      events_in_db: null,
+      coverage_percentage: null,
+      alert: true,
+      reason: `Add CITY_LUMA_URLS["${city}"] in coverage.js`,
+    };
+  }
+
   let lumaEvents = [];
   let fetchError = null;
   try {
-    lumaEvents = await fetchLumaAustinEvents();
+    lumaEvents = await fetchLumaEvents(lumaUrl);
   } catch (e) {
     fetchError = e.message;
   }
 
-  const ourEvents = await fetchOurEvents();
+  const ourEvents = await fetchOurEvents(city);
 
   if (fetchError) {
     return {
       status: 'error',
+      city,
       error: `Luma fetch failed: ${fetchError}`,
       events_on_luma: null,
       events_in_db: ourEvents.length,
       coverage_percentage: null,
       alert: true,
-      reason: `Could not reach luma.com/austin — watchdog coverage check failed. May be Luma rate-limiting or a structure change.`,
+      reason: `Could not reach ${lumaUrl} — watchdog coverage check failed. May be Luma rate-limiting or a structure change.`,
     };
   }
 
@@ -212,6 +236,8 @@ export async function checkCoverage() {
 
   return {
     status,
+    city,
+    luma_url: lumaUrl,
     events_on_luma: lumaEvents.length,
     ai_events_on_luma: aiLumaEvents.length,
     events_in_db: ourEvents.length,
@@ -220,15 +246,16 @@ export async function checkCoverage() {
     gaps,
     alert,
     reason: coveragePercentage === null
-      ? `No AI-related events found on luma.com/austin in the next ${LOOKAHEAD_DAYS} days`
-      : `Coverage ${coveragePercentage}%: ${matched.length}/${aiLumaEvents.length} AI events on Luma are in our DB${gaps.length ? ` (${gaps.length} gaps)` : ''}`,
+      ? `No AI-related events found on ${lumaUrl} in the next ${LOOKAHEAD_DAYS} days`
+      : `Coverage ${coveragePercentage}%: ${matched.length}/${aiLumaEvents.length} AI events on Luma are in our DB for ${city}${gaps.length ? ` (${gaps.length} gaps)` : ''}`,
   };
 }
 
 // CLI entry point: node scripts/coverage.js
 const isDirectRun = process.argv[1] && process.argv[1].endsWith('coverage.js');
 if (isDirectRun) {
-  checkCoverage()
+  const city = process.env.CITY || 'austin';
+  checkCoverage(city)
     .then(result => {
       console.log(JSON.stringify(result, null, 2));
       if (result.alert) {

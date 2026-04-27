@@ -8,7 +8,7 @@ import { checkLiveness } from './liveness.js';
 import { checkCoverage } from './coverage.js';
 import { createClient } from '@supabase/supabase-js';
 
-async function writeAuditRow(liveness, coverage) {
+async function writeAuditRow(city, liveness, coverage) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -22,6 +22,7 @@ async function writeAuditRow(liveness, coverage) {
   const { error } = await supabase
     .from('coverage_audits')
     .insert({
+      city,
       events_in_db: liveness.events_count,
       events_on_luma: coverage.ai_events_on_luma,
       coverage_percentage: coverage.coverage_percentage,
@@ -42,21 +43,17 @@ async function writeAuditRow(liveness, coverage) {
   return { written: true };
 }
 
-async function main() {
-  if (process.env.WATCHDOG_DISABLED === '1') {
-    console.log('🔒 WATCHDOG_DISABLED=1 — skipping all checks.');
-    process.exit(0);
-  }
-
-  console.log('🐕 austin-ai-events-watchdog running');
-  console.log(`   Time: ${new Date().toISOString()}\n`);
+async function runForCity(city) {
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`🐕 Watchdog: city=${city}`);
+  console.log('='.repeat(50));
 
   let liveness;
   let coverage;
   let exitCode = 0;
 
   try {
-    liveness = await checkLiveness();
+    liveness = await checkLiveness(city);
     console.log('Liveness check:');
     console.log(`   Status:    ${liveness.status}`);
     console.log(`   Events:    ${liveness.events_count}/${liveness.threshold}`);
@@ -67,14 +64,14 @@ async function main() {
     }
   } catch (e) {
     console.error(`\n💥 Liveness check crashed: ${e.message}`);
-    liveness = { status: 'error', error: e.message, events_count: null };
+    liveness = { status: 'error', city, error: e.message, events_count: null };
     exitCode = 2;
   }
 
   console.log();
 
   try {
-    coverage = await checkCoverage();
+    coverage = await checkCoverage(city);
     console.log('Coverage check:');
     console.log(`   Status:    ${coverage.status}`);
     console.log(`   Luma AI:   ${coverage.ai_events_on_luma}/${coverage.events_on_luma}`);
@@ -93,17 +90,41 @@ async function main() {
     }
   } catch (e) {
     console.error(`\n💥 Coverage check crashed: ${e.message}`);
-    coverage = { status: 'error', error: e.message };
+    coverage = { status: 'error', city, error: e.message };
     exitCode = 2;
   }
 
   console.log();
   if (liveness && coverage) {
-    await writeAuditRow(liveness, coverage);
+    await writeAuditRow(city, liveness, coverage);
   }
 
-  console.log(`\n🐕 Watchdog exit: ${exitCode}`);
-  process.exit(exitCode);
+  return exitCode;
+}
+
+async function main() {
+  if (process.env.WATCHDOG_DISABLED === '1') {
+    console.log('🔒 WATCHDOG_DISABLED=1 — skipping all checks.');
+    process.exit(0);
+  }
+
+  console.log('🐕 austin-ai-events-watchdog running');
+  console.log(`   Time: ${new Date().toISOString()}`);
+
+  // Cities to check. Comma-separated env var; default is austin only.
+  // Any city in this list must have its Luma reference URL configured in
+  // coverage.js (CITY_LUMA_URLS).
+  const citiesEnv = process.env.WATCHDOG_CITIES || 'austin';
+  const cities = citiesEnv.split(',').map(s => s.trim()).filter(Boolean);
+
+  let maxExit = 0;
+  for (const city of cities) {
+    const code = await runForCity(city);
+    maxExit = Math.max(maxExit, code);
+  }
+
+  console.log(`\n🐕 Watchdog exit: ${maxExit} (checked ${cities.length} cities)`);
+  process.exit(maxExit);
 }
 
 main().catch(e => {

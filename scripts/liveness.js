@@ -12,7 +12,7 @@ import { createClient } from '@supabase/supabase-js';
 
 const LOOKAHEAD_DAYS = 14;
 
-export async function checkLiveness() {
+export async function checkLiveness(city = 'austin') {
   const supabaseUrl = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
   const threshold = parseInt(process.env.ALERT_THRESHOLD_EVENTS || '5', 10);
@@ -28,6 +28,7 @@ export async function checkLiveness() {
   const { data, error, count } = await supabase
     .from('events')
     .select('id, title, start_time', { count: 'exact' })
+    .eq('city', city)
     .is('deleted_at', null)
     .gte('start_time', now.toISOString())
     .lte('start_time', horizon.toISOString())
@@ -36,6 +37,7 @@ export async function checkLiveness() {
   if (error) {
     return {
       status: 'error',
+      city,
       error: error.message,
       events_count: null,
       threshold,
@@ -49,20 +51,21 @@ export async function checkLiveness() {
 
   let status = 'healthy';
   let alert = false;
-  let reason = `${eventsCount} upcoming events in the next ${LOOKAHEAD_DAYS} days (threshold: ${threshold})`;
+  let reason = `${eventsCount} upcoming events for ${city} in the next ${LOOKAHEAD_DAYS} days (threshold: ${threshold})`;
 
   if (eventsCount === 0) {
     status = 'empty';
     alert = true;
-    reason = `No upcoming events in the next ${LOOKAHEAD_DAYS} days — calendar is empty. This is either a dead system or a very quiet month.`;
+    reason = `No upcoming events for ${city} in the next ${LOOKAHEAD_DAYS} days — calendar is empty. This is either a dead system or a very quiet month.`;
   } else if (eventsCount < threshold) {
     status = 'degraded';
     alert = true;
-    reason = `Only ${eventsCount} upcoming events in the next ${LOOKAHEAD_DAYS} days (threshold: ${threshold}). Investigate whether scrapers are healthy.`;
+    reason = `Only ${eventsCount} upcoming events for ${city} in the next ${LOOKAHEAD_DAYS} days (threshold: ${threshold}). Investigate whether scrapers are healthy.`;
   }
 
   return {
     status,
+    city,
     events_count: eventsCount,
     threshold,
     alert,
@@ -75,7 +78,8 @@ export async function checkLiveness() {
 // CLI entry point: node scripts/liveness.js
 const isDirectRun = process.argv[1] && process.argv[1].endsWith('liveness.js');
 if (isDirectRun) {
-  checkLiveness()
+  const city = process.env.CITY || 'austin';
+  checkLiveness(city)
     .then(result => {
       console.log(JSON.stringify(result, null, 2));
       if (result.alert) {
