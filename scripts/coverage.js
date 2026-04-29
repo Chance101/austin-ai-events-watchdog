@@ -18,12 +18,21 @@ import * as cheerio from 'cheerio';
 const LOOKAHEAD_DAYS = 14;
 
 // Per-city Luma reference URL. The watchdog compares our DB against this
-// public Luma calendar to detect coverage drops. For SF, luma.com/sf is too
-// noisy (matches Austin's experience with luma.com/austin); luma.com/genai-sf
-// (Bond AI, 120k+ members) is the cleanest ground-truth comparison.
+// public Luma calendar to detect coverage drops. **Reference must be a strict
+// superset of the city's config sources, never a config source itself** —
+// otherwise the comparison is circular and can't catch missed sources,
+// throttling, or coverage gaps. City aggregators (luma.com/<slug>) are the
+// natural superset: noisy, but the AI_KEYWORDS filter handles that, and they
+// stay outside config by design (too noisy to auto-trust). Curator calendars
+// like luma.com/genai-sf are config sources by construction, so they fail
+// this test — initial SF reference 2026-04-26 was genai-sf and was found to
+// produce events_on_luma=0 for circular reasons (parser mismatch surfaced
+// it; the deeper issue is the principle violation). Switched to luma.com/sf
+// 2026-04-29. Treat coverage% as a side metric; the actionable signal is
+// the gap list (events watchdog finds that aren't in DB).
 const CITY_LUMA_URLS = {
   austin: 'https://luma.com/austin',
-  sf: 'https://luma.com/genai-sf',
+  sf: 'https://luma.com/sf',
 };
 
 // Rough AI-relevance filter. Not perfect — the main system's validator
