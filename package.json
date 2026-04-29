@@ -10,6 +10,7 @@
     "coverage": "node scripts/coverage.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.1",
     "@supabase/supabase-js": "^2.47.0",
     "cheerio": "^1.0.0"
   },

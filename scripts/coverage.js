@@ -14,6 +14,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import * as cheerio from 'cheerio';
+import Anthropic from '@anthropic-ai/sdk';
 
 const LOOKAHEAD_DAYS = 14;
 
@@ -35,23 +36,49 @@ const CITY_LUMA_URLS = {
   sf: 'https://luma.com/sf',
 };
 
-// Rough AI-relevance filter. Not perfect — the main system's validator
-// is more sophisticated — but good enough for a coverage sanity check.
-const AI_KEYWORDS = [
-  'ai', 'a.i.', 'artificial intelligence', 'ml', 'machine learning',
-  'llm', 'gpt', 'openai', 'claude', 'anthropic', 'agent', 'agents',
-  'neural', 'deep learning', 'generative', 'vibe code', 'hackathon',
-  'prompt engineering', 'rag', 'embedding', 'transformer',
-];
+/**
+ * Filter a list of events to AI-related ones via a single Haiku call.
+ * Replaces a hardcoded keyword list — Claude's vocabulary stays current as
+ * new AI tools/terms emerge (Hermes, Cline, Cursor, …), no maintenance.
+ *
+ * Independence note: this uses a different prompt and code path than the
+ * agent's validator, so the watchdog still catches scraper/parser/pipeline
+ * bugs in the agent. Sharing the Anthropic API as an external dependency
+ * doesn't compromise independence — when Anthropic is down, the agent
+ * doesn't run anyway, so there's nothing for the watchdog to verify.
+ *
+ * One batched call per audit (~20 titles) → ~$0.0005/audit on Haiku 4.5.
+ */
+async function filterAIEvents(events) {
+  if (events.length === 0) return [];
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY is required for the AI filter');
+  }
+  const client = new Anthropic({ apiKey });
 
-function isAIRelated(title, description = '') {
-  const text = `${title} ${description}`.toLowerCase();
-  return AI_KEYWORDS.some(kw => {
-    if (kw.length <= 3) {
-      return new RegExp(`\\b${kw}\\b`, 'i').test(text);
-    }
-    return text.includes(kw);
+  const numbered = events.map((e, i) => `${i}: ${e.title}`).join('\n');
+  const response = await client.messages.create({
+    model: 'claude-haiku-4-5',
+    max_tokens: 256,
+    messages: [{
+      role: 'user',
+      content: `You filter event titles for an AI-events calendar. For each numbered title, decide if it's about artificial intelligence, machine learning, LLMs, AI tools/agents/products, or AI builder communities. Exclude general tech, business, social, or non-AI topics.
+
+Titles:
+${numbered}
+
+Return ONLY a JSON array of the indices that ARE AI-related — no prose, no explanation. Example: [0, 2, 5]`,
+    }],
   });
+
+  const text = response.content.find(b => b.type === 'text')?.text?.trim() ?? '';
+  const match = text.match(/\[[\d,\s]*\]/);
+  if (!match) {
+    throw new Error(`Haiku returned non-array response: ${text.slice(0, 200)}`);
+  }
+  const indices = JSON.parse(match[0]);
+  return indices.map(i => events[i]).filter(Boolean);
 }
 
 /**
@@ -213,8 +240,27 @@ export async function checkCoverage(city = 'austin') {
     };
   }
 
-  // Filter Luma events to AI-related only
-  const aiLumaEvents = lumaEvents.filter(e => isAIRelated(e.title));
+  // Filter Luma events to AI-related only via Haiku classifier
+  let aiLumaEvents = [];
+  let filterError = null;
+  try {
+    aiLumaEvents = await filterAIEvents(lumaEvents);
+  } catch (e) {
+    filterError = e.message;
+  }
+
+  if (filterError) {
+    return {
+      status: 'error',
+      city,
+      error: `AI filter failed: ${filterError}`,
+      events_on_luma: lumaEvents.length,
+      events_in_db: ourEvents.length,
+      coverage_percentage: null,
+      alert: true,
+      reason: `Haiku classification failed — watchdog can't determine which Luma events are AI-related this run. Likely Anthropic API issue.`,
+    };
+  }
 
   // For each AI Luma event, check if it's in our DB
   const matched = [];

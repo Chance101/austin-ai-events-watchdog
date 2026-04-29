@@ -34,6 +34,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALERT_THRESHOLD_EVENTS: ${{ secrets.ALERT_THRESHOLD_EVENTS || '5' }}
           WATCHDOG_DISABLED: ${{ secrets.WATCHDOG_DISABLED || '0' }}
           # Comma-separated list of city slugs to check. Each must have a Luma
