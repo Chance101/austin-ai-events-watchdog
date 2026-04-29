@@ -2,6 +2,10 @@
  * Main watchdog entrypoint — runs both checks in sequence, writes a
  * coverage_audits row (if the service role key is present), and exits
  * non-zero if anything alerted so the GitHub Action surfaces it.
+ *
+ * Watchdog principle (2026-04-29 reset): writes ONLY counts back to the
+ * agent. No event titles, no gap lists, no per-platform breakdown,
+ * no coverage percentage. Just events_in_db and events_seen.
  */
 
 import { checkLiveness } from './liveness.js';
@@ -12,27 +16,31 @@ async function writeAuditRow(city, liveness, coverage) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  // If no service role key, skip the write — stdout logging only
   if (!supabaseUrl || !serviceRoleKey) {
     console.log('\n(No SUPABASE_SERVICE_ROLE_KEY set — skipping coverage_audits write)');
     return { written: false };
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey);
+  const eventsInDb = liveness.events_count;
+  const eventsSeen = coverage.events_seen ?? null;
+
   const { error } = await supabase
     .from('coverage_audits')
     .insert({
       city,
-      events_in_db: liveness.events_count,
-      events_on_luma: coverage.ai_events_on_luma,
-      coverage_percentage: coverage.coverage_percentage,
-      gap_event_titles: coverage.gaps ? coverage.gaps.map(g => g.title) : [],
+      events_in_db: eventsInDb,
+      events_seen: eventsSeen,
       liveness_status: liveness.status,
-      notes: `${liveness.reason} | ${coverage.reason}`,
+      notes: `liveness=${liveness.status}, events_in_db=${eventsInDb ?? 'n/a'}, events_seen=${eventsSeen ?? 'n/a'}`,
+      // Legacy columns intentionally left null — watchdog no longer leaks
+      // specific events, per-platform counts, or coverage percentages.
+      events_on_luma: null,
+      coverage_percentage: null,
+      gap_event_titles: null,
     });
 
   if (error) {
-    // The table may not exist yet — graceful degradation
     if (error.code === '42P01' || error.message.includes('does not exist')) {
       console.log('\n(coverage_audits table does not exist yet — skipping write)');
       return { written: false, reason: 'table_missing' };
@@ -74,23 +82,16 @@ async function runForCity(city) {
     coverage = await checkCoverage(city);
     console.log('Coverage check:');
     console.log(`   Status:    ${coverage.status}`);
-    console.log(`   Luma AI:   ${coverage.ai_events_on_luma}/${coverage.events_on_luma}`);
-    console.log(`   DB:        ${coverage.events_in_db}`);
-    console.log(`   Coverage:  ${coverage.coverage_percentage ?? 'n/a'}%`);
+    console.log(`   DB:        ${coverage.events_in_db ?? 'n/a'}`);
+    console.log(`   Seen:      ${coverage.events_seen ?? 'n/a'}`);
     console.log(`   Reason:    ${coverage.reason}`);
-    if (coverage.gaps && coverage.gaps.length > 0) {
-      console.log(`   Gaps (${coverage.gaps.length}):`);
-      for (const g of coverage.gaps.slice(0, 10)) {
-        console.log(`     - ${g.title} (${g.start_time})`);
-      }
-    }
     if (coverage.alert) {
       console.error(`\n   ⚠️  COVERAGE ALERT`);
       exitCode = Math.max(exitCode, 1);
     }
   } catch (e) {
     console.error(`\n💥 Coverage check crashed: ${e.message}`);
-    coverage = { status: 'error', city, error: e.message };
+    coverage = { status: 'error', city, error: e.message, events_in_db: null, events_seen: null };
     exitCode = 2;
   }
 
@@ -111,9 +112,6 @@ async function main() {
   console.log('🐕 austin-ai-events-watchdog running');
   console.log(`   Time: ${new Date().toISOString()}`);
 
-  // Cities to check. Comma-separated env var; default is austin only.
-  // Any city in this list must have its Luma reference URL configured in
-  // coverage.js (CITY_LUMA_URLS).
   const citiesEnv = process.env.WATCHDOG_CITIES || 'austin';
   const cities = citiesEnv.split(',').map(s => s.trim()).filter(Boolean);
 

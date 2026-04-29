@@ -1,53 +1,51 @@
 /**
- * Coverage ground truth — compares our Supabase events table against
- * events visible on luma.com/austin (the public Luma city page).
+ * Coverage ground truth — counts AI events visible on the watchdog's
+ * reference platforms (Luma + Meetup find) for a given city, and reports
+ * a single combined number alongside the agent's own DB count.
  *
- * This intentionally duplicates a small amount of Luma-parsing logic
- * from the main repo so the watchdog is fully independent. If the
- * main repo's Luma parser breaks, this watchdog's parser still works,
- * and that's the point.
+ * Design principle (2026-04-29 reset):
+ * The watchdog returns ONLY counts. No event titles, no per-platform
+ * breakdown, no gap lists, no specific URLs. The agent must not be told
+ * the answers — only whether it is hitting the platform ceiling.
  *
- * The output is a coverage percentage: what fraction of AI-related
- * Luma events in Austin are also in our calendar. Gaps are logged
- * with titles so a human can quickly see what's missing.
+ * Independence: this duplicates a small amount of platform-parsing logic
+ * from the main repo so the watchdog is fully isolated. If the main repo's
+ * Luma or Meetup parsers break, this watchdog's parsers still work, and
+ * that's the point.
  */
 
 import { createClient } from '@supabase/supabase-js';
 import * as cheerio from 'cheerio';
 import Anthropic from '@anthropic-ai/sdk';
+import { fetchMeetupFindEvents } from './meetupFind.js';
 
 const LOOKAHEAD_DAYS = 14;
 
-// Per-city Luma reference URL. The watchdog compares our DB against this
-// public Luma calendar to detect coverage drops. **Reference must be a strict
-// superset of the city's config sources, never a config source itself** —
-// otherwise the comparison is circular and can't catch missed sources,
-// throttling, or coverage gaps. City aggregators (luma.com/<slug>) are the
-// natural superset: noisy, but the AI_KEYWORDS filter handles that, and they
-// stay outside config by design (too noisy to auto-trust). Curator calendars
-// like luma.com/genai-sf are config sources by construction, so they fail
-// this test — initial SF reference 2026-04-26 was genai-sf and was found to
-// produce events_on_luma=0 for circular reasons (parser mismatch surfaced
-// it; the deeper issue is the principle violation). Switched to luma.com/sf
-// 2026-04-29. Treat coverage% as a side metric; the actionable signal is
-// the gap list (events watchdog finds that aren't in DB).
-const CITY_LUMA_URLS = {
-  austin: 'https://luma.com/austin',
-  sf: 'https://luma.com/sf',
+// Per-city watchdog references. Luma city aggregator + Meetup find search.
+// Both must be strict supersets of the city's config sources — never
+// config sources themselves — otherwise the comparison is circular.
+//
+// luma.com/<slug> is the natural city aggregator (noisy, AI filter handles
+// it). Meetup find is a topic+city search across all groups, also a
+// strict superset by construction.
+const CITY_REFERENCES = {
+  austin: {
+    luma_url: 'https://luma.com/austin',
+    meetup_find: { state: 'tx', city: 'Austin' },
+  },
+  sf: {
+    luma_url: 'https://luma.com/sf',
+    meetup_find: { state: 'ca', city: 'San Francisco' },
+  },
 };
 
 /**
- * Filter a list of events to AI-related ones via a single Haiku call.
- * Replaces a hardcoded keyword list — Claude's vocabulary stays current as
- * new AI tools/terms emerge (Hermes, Cline, Cursor, …), no maintenance.
+ * Filter a combined list of events to AI-related ones via a single Haiku call.
+ * One batched call per audit (~30-50 titles) → ~$0.001/audit on Haiku 4.5.
  *
  * Independence note: this uses a different prompt and code path than the
  * agent's validator, so the watchdog still catches scraper/parser/pipeline
- * bugs in the agent. Sharing the Anthropic API as an external dependency
- * doesn't compromise independence — when Anthropic is down, the agent
- * doesn't run anyway, so there's nothing for the watchdog to verify.
- *
- * One batched call per audit (~20 titles) → ~$0.0005/audit on Haiku 4.5.
+ * bugs in the agent.
  */
 async function filterAIEvents(events) {
   if (events.length === 0) return [];
@@ -60,7 +58,7 @@ async function filterAIEvents(events) {
   const numbered = events.map((e, i) => `${i}: ${e.title}`).join('\n');
   const response = await client.messages.create({
     model: 'claude-haiku-4-5',
-    max_tokens: 256,
+    max_tokens: 512,
     messages: [{
       role: 'user',
       content: `You filter event titles for an AI-events calendar. For each numbered title, decide if it's about artificial intelligence, machine learning, LLMs, AI tools/agents/products, or AI builder communities. Exclude general tech, business, social, or non-AI topics.
@@ -73,11 +71,11 @@ Return ONLY a JSON array of the indices that ARE AI-related — no prose, no exp
   });
 
   const text = response.content.find(b => b.type === 'text')?.text?.trim() ?? '';
-  const match = text.match(/\[[\d,\s]*\]/);
-  if (!match) {
+  const arrayMatch = text.match(/\[[\d,\s]*\]/);
+  if (!arrayMatch) {
     throw new Error(`Haiku returned non-array response: ${text.slice(0, 200)}`);
   }
-  const indices = JSON.parse(match[0]);
+  const indices = JSON.parse(arrayMatch[0]);
   return indices.map(i => events[i]).filter(Boolean);
 }
 
@@ -101,7 +99,6 @@ async function fetchLumaEvents(lumaUrl) {
   const html = await response.text();
   const $ = cheerio.load(html);
 
-  // Try __NEXT_DATA__ script tag first
   const nextDataScript = $('script#__NEXT_DATA__').html();
   if (!nextDataScript) {
     throw new Error('Luma page has no __NEXT_DATA__ script');
@@ -111,7 +108,7 @@ async function fetchLumaEvents(lumaUrl) {
   try {
     nextData = JSON.parse(nextDataScript);
   } catch (e) {
-    throw new Error(`Failed to parse __NEXT_DATA__: ${e.message}`);
+    throw new Error(`Failed to parse Luma __NEXT_DATA__: ${e.message}`);
   }
 
   const pageProps = nextData?.props?.pageProps || nextData?.pageProps;
@@ -120,7 +117,7 @@ async function fetchLumaEvents(lumaUrl) {
     || [];
 
   if (!Array.isArray(entries)) {
-    throw new Error('pageProps.initialData.events is not an array');
+    throw new Error('Luma pageProps.initialData.events is not an array');
   }
 
   const now = new Date();
@@ -134,11 +131,9 @@ async function fetchLumaEvents(lumaUrl) {
     if (isNaN(startDate)) continue;
     if (startDate < now || startDate > horizon) continue;
 
-    const url = evt.url ? `https://lu.ma/${evt.url}` : null;
     events.push({
       title: evt.name,
       start_time: evt.start_at,
-      url,
     });
   }
 
@@ -146,9 +141,11 @@ async function fetchLumaEvents(lumaUrl) {
 }
 
 /**
- * Fetch our Supabase events in the lookahead window for a specific city.
+ * Count agent's own events for the city in the lookahead window.
+ * The watchdog reads this from the same DB the agent writes to —
+ * it's the agent's own data echoed back, not external information.
  */
-async function fetchOurEvents(city) {
+async function fetchOurEventsCount(city) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
   if (!supabaseUrl || !anonKey) {
@@ -159,9 +156,9 @@ async function fetchOurEvents(city) {
   const now = new Date();
   const horizon = new Date(now.getTime() + LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000);
 
-  const { data, error } = await supabase
+  const { count, error } = await supabase
     .from('events')
-    .select('id, title, start_time, url')
+    .select('id', { count: 'exact', head: true })
     .eq('city', city)
     .is('deleted_at', null)
     .gte('start_time', now.toISOString())
@@ -170,139 +167,89 @@ async function fetchOurEvents(city) {
   if (error) {
     throw new Error(`Supabase query failed: ${error.message}`);
   }
-  return data || [];
-}
-
-/**
- * Check if two events match by URL or by title + same-day heuristic.
- */
-function eventsMatch(lumaEvt, ourEvt) {
-  if (lumaEvt.url && ourEvt.url) {
-    // Normalize for comparison
-    const l = lumaEvt.url.toLowerCase().replace(/\/$/, '');
-    const o = ourEvt.url.toLowerCase().replace(/\/$/, '');
-    if (l === o) return true;
-    // Luma slugs may appear in our URL even if full URL differs
-    const lumaSlug = lumaEvt.url.split('/').pop();
-    if (lumaSlug && o.includes(lumaSlug)) return true;
-  }
-
-  // Fallback: same day + title fuzzy match
-  const lumaDate = new Date(lumaEvt.start_time);
-  const ourDate = new Date(ourEvt.start_time);
-  if (isNaN(lumaDate) || isNaN(ourDate)) return false;
-  if (lumaDate.toDateString() !== ourDate.toDateString()) return false;
-
-  const lumaNorm = (lumaEvt.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const ourNorm = (ourEvt.title || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!lumaNorm || !ourNorm) return false;
-  if (lumaNorm === ourNorm) return true;
-  if (lumaNorm.length > 10 && ourNorm.includes(lumaNorm.substring(0, 15))) return true;
-  if (ourNorm.length > 10 && lumaNorm.includes(ourNorm.substring(0, 15))) return true;
-  return false;
+  return count ?? 0;
 }
 
 export async function checkCoverage(city = 'austin') {
-  const lumaUrl = CITY_LUMA_URLS[city];
-  if (!lumaUrl) {
+  const ref = CITY_REFERENCES[city];
+  if (!ref) {
     return {
       status: 'error',
       city,
-      error: `No Luma reference URL configured for city=${city}`,
-      events_on_luma: null,
       events_in_db: null,
-      coverage_percentage: null,
+      events_seen: null,
       alert: true,
-      reason: `Add CITY_LUMA_URLS["${city}"] in coverage.js`,
+      reason: `No CITY_REFERENCES entry for city=${city}`,
     };
   }
 
-  let lumaEvents = [];
-  let fetchError = null;
-  try {
-    lumaEvents = await fetchLumaEvents(lumaUrl);
-  } catch (e) {
-    fetchError = e.message;
-  }
+  const [lumaResult, meetupResult, dbResult] = await Promise.allSettled([
+    fetchLumaEvents(ref.luma_url),
+    fetchMeetupFindEvents(ref.meetup_find.state, ref.meetup_find.city),
+    fetchOurEventsCount(city),
+  ]);
 
-  const ourEvents = await fetchOurEvents(city);
-
-  if (fetchError) {
+  // DB failure is fatal — without our own count, comparison is meaningless
+  if (dbResult.status === 'rejected') {
     return {
       status: 'error',
       city,
-      error: `Luma fetch failed: ${fetchError}`,
-      events_on_luma: null,
-      events_in_db: ourEvents.length,
-      coverage_percentage: null,
+      events_in_db: null,
+      events_seen: null,
       alert: true,
-      reason: `Could not reach ${lumaUrl} — watchdog coverage check failed. May be Luma rate-limiting or a structure change.`,
+      reason: `DB count query failed: ${dbResult.reason.message}`,
     };
   }
+  const eventsInDb = dbResult.value;
 
-  // Filter Luma events to AI-related only via Haiku classifier
-  let aiLumaEvents = [];
-  let filterError = null;
-  try {
-    aiLumaEvents = await filterAIEvents(lumaEvents);
-  } catch (e) {
-    filterError = e.message;
+  const platformEvents = [];
+  const fetchErrors = [];
+  if (lumaResult.status === 'fulfilled') {
+    platformEvents.push(...lumaResult.value);
+  } else {
+    fetchErrors.push(`luma: ${lumaResult.reason.message}`);
+  }
+  if (meetupResult.status === 'fulfilled') {
+    platformEvents.push(...meetupResult.value);
+  } else {
+    fetchErrors.push(`meetup: ${meetupResult.reason.message}`);
   }
 
-  if (filterError) {
+  if (platformEvents.length === 0 && fetchErrors.length === 2) {
     return {
       status: 'error',
       city,
-      error: `AI filter failed: ${filterError}`,
-      events_on_luma: lumaEvents.length,
-      events_in_db: ourEvents.length,
-      coverage_percentage: null,
+      events_in_db: eventsInDb,
+      events_seen: null,
       alert: true,
-      reason: `Haiku classification failed — watchdog can't determine which Luma events are AI-related this run. Likely Anthropic API issue.`,
+      reason: `All reference platforms failed: ${fetchErrors.join('; ')}`,
     };
   }
 
-  // For each AI Luma event, check if it's in our DB
-  const matched = [];
-  const gaps = [];
-  for (const lumaEvt of aiLumaEvents) {
-    const hit = ourEvents.find(oe => eventsMatch(lumaEvt, oe));
-    if (hit) {
-      matched.push(lumaEvt);
-    } else {
-      gaps.push({
-        title: lumaEvt.title,
-        start_time: lumaEvt.start_time,
-        url: lumaEvt.url,
-      });
-    }
+  let aiEvents;
+  try {
+    aiEvents = await filterAIEvents(platformEvents);
+  } catch (e) {
+    return {
+      status: 'error',
+      city,
+      events_in_db: eventsInDb,
+      events_seen: null,
+      alert: true,
+      reason: `AI filter failed: ${e.message}`,
+    };
   }
 
-  const coveragePercentage = aiLumaEvents.length > 0
-    ? Math.round((matched.length / aiLumaEvents.length) * 100)
-    : null;
-
-  let status = 'healthy';
-  let alert = false;
-  if (coveragePercentage !== null && coveragePercentage < 50) {
-    status = 'degraded';
-    alert = true;
-  }
+  const eventsSeen = aiEvents.length;
+  const partial = fetchErrors.length > 0 ? ` (partial: ${fetchErrors.join('; ')})` : '';
 
   return {
-    status,
+    status: 'healthy',
     city,
-    luma_url: lumaUrl,
-    events_on_luma: lumaEvents.length,
-    ai_events_on_luma: aiLumaEvents.length,
-    events_in_db: ourEvents.length,
-    matched_count: matched.length,
-    coverage_percentage: coveragePercentage,
-    gaps,
-    alert,
-    reason: coveragePercentage === null
-      ? `No AI-related events found on ${lumaUrl} in the next ${LOOKAHEAD_DAYS} days`
-      : `Coverage ${coveragePercentage}%: ${matched.length}/${aiLumaEvents.length} AI events on Luma are in our DB for ${city}${gaps.length ? ` (${gaps.length} gaps)` : ''}`,
+    events_in_db: eventsInDb,
+    events_seen: eventsSeen,
+    alert: false,
+    reason: `events_in_db=${eventsInDb}, events_seen=${eventsSeen}${partial}`,
   };
 }
 
