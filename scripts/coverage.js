@@ -19,7 +19,9 @@ import * as cheerio from 'cheerio';
 import Anthropic from '@anthropic-ai/sdk';
 import { fetchMeetupFindEvents } from './meetupFind.js';
 
-const LOOKAHEAD_DAYS = 14;
+// MUST match LOOKAHEAD_DAYS in meetupFind.js + liveness.js + run.js writeAuditRow.
+// 30 = match the frontend calendar window (what users actually see).
+const LOOKAHEAD_DAYS = 30;
 
 // Per-city watchdog references. Luma city aggregator + Meetup find search.
 // Both must be strict supersets of the city's config sources — never

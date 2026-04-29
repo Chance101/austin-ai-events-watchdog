@@ -10,7 +10,8 @@
 
 import { createClient } from '@supabase/supabase-js';
 
-const LOOKAHEAD_DAYS = 14;
+// MUST match LOOKAHEAD_DAYS in coverage.js + meetupFind.js + run.js writeAuditRow.
+const LOOKAHEAD_DAYS = 30;
 
 export async function checkLiveness(city = 'austin') {
   const supabaseUrl = process.env.SUPABASE_URL;

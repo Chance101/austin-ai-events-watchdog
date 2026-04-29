@@ -24,6 +24,8 @@ async function writeAuditRow(city, liveness, coverage) {
   const supabase = createClient(supabaseUrl, serviceRoleKey);
   const eventsInDb = liveness.events_count;
   const eventsSeen = coverage.events_seen ?? null;
+  // MUST match LOOKAHEAD_DAYS in coverage.js, meetupFind.js, liveness.js.
+  const lookaheadDays = 30;
 
   const { error } = await supabase
     .from('coverage_audits')
@@ -31,8 +33,9 @@ async function writeAuditRow(city, liveness, coverage) {
       city,
       events_in_db: eventsInDb,
       events_seen: eventsSeen,
+      lookahead_days: lookaheadDays,
       liveness_status: liveness.status,
-      notes: `liveness=${liveness.status}, events_in_db=${eventsInDb ?? 'n/a'}, events_seen=${eventsSeen ?? 'n/a'}`,
+      notes: `liveness=${liveness.status}, events_in_db=${eventsInDb ?? 'n/a'}, events_seen=${eventsSeen ?? 'n/a'} (next ${lookaheadDays}d)`,
       // Legacy columns intentionally left null — watchdog no longer leaks
       // specific events, per-platform counts, or coverage percentages.
       events_on_luma: null,

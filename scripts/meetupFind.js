@@ -8,7 +8,8 @@
  * Returns events in the same shape as fetchLumaEvents: {title, start_time, url}.
  */
 
-const LOOKAHEAD_DAYS = 14;
+// MUST match LOOKAHEAD_DAYS in coverage.js + liveness.js + run.js writeAuditRow.
+const LOOKAHEAD_DAYS = 30;
 
 function buildFindUrl(stateCode, cityName) {
   const state = stateCode.toLowerCase();
