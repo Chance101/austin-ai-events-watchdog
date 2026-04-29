@@ -136,6 +136,7 @@ async function fetchLumaEvents(lumaUrl) {
     events.push({
       title: evt.name,
       start_time: evt.start_at,
+      url: evt.url ? `https://lu.ma/${evt.url}` : null,
     });
   }
 
@@ -143,11 +144,11 @@ async function fetchLumaEvents(lumaUrl) {
 }
 
 /**
- * Count agent's own events for the city in the lookahead window.
- * The watchdog reads this from the same DB the agent writes to —
- * it's the agent's own data echoed back, not external information.
+ * Fetch agent's own events for the city in the lookahead window.
+ * Returns urls + count. URLs are used internally for overlap matching;
+ * they are NOT shared back into the agent's input — only counts are written.
  */
-async function fetchOurEventsCount(city) {
+async function fetchOurEvents(city) {
   const supabaseUrl = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
   if (!supabaseUrl || !anonKey) {
@@ -158,9 +159,9 @@ async function fetchOurEventsCount(city) {
   const now = new Date();
   const horizon = new Date(now.getTime() + LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000);
 
-  const { count, error } = await supabase
+  const { data, error } = await supabase
     .from('events')
-    .select('id', { count: 'exact', head: true })
+    .select('url')
     .eq('city', city)
     .is('deleted_at', null)
     .gte('start_time', now.toISOString())
@@ -169,7 +170,26 @@ async function fetchOurEventsCount(city) {
   if (error) {
     throw new Error(`Supabase query failed: ${error.message}`);
   }
-  return count ?? 0;
+  const urls = (data || []).map(r => (r.url || '').toLowerCase().replace(/\/$/, '')).filter(Boolean);
+  return { count: data?.length ?? 0, urls };
+}
+
+/**
+ * Check if a platform event's URL is in the agent's DB.
+ * Tries exact match, then platform-specific id/slug fallbacks.
+ * URL set is opaque to callers — only the resulting boolean leaves this function.
+ */
+function isInDb(eventUrl, dbUrls, dbUrlSet) {
+  if (!eventUrl) return false;
+  const norm = eventUrl.toLowerCase().replace(/\/$/, '');
+  if (dbUrlSet.has(norm)) return true;
+  // Meetup: events/<id>/ — match on id substring in case URL form differs
+  const meetupId = norm.match(/events\/(\d+)/)?.[1];
+  if (meetupId && dbUrls.some(u => u.includes(meetupId))) return true;
+  // Luma: lu.ma/<slug> — match on slug substring
+  const lumaSlug = norm.match(/lu\.ma\/([a-z0-9-]+)$/)?.[1];
+  if (lumaSlug && dbUrls.some(u => u.includes(lumaSlug))) return true;
+  return false;
 }
 
 export async function checkCoverage(city = 'austin') {
@@ -180,6 +200,7 @@ export async function checkCoverage(city = 'austin') {
       city,
       events_in_db: null,
       events_seen: null,
+      events_seen_in_db: null,
       alert: true,
       reason: `No CITY_REFERENCES entry for city=${city}`,
     };
@@ -188,21 +209,22 @@ export async function checkCoverage(city = 'austin') {
   const [lumaResult, meetupResult, dbResult] = await Promise.allSettled([
     fetchLumaEvents(ref.luma_url),
     fetchMeetupFindEvents(ref.meetup_find.state, ref.meetup_find.city),
-    fetchOurEventsCount(city),
+    fetchOurEvents(city),
   ]);
 
-  // DB failure is fatal — without our own count, comparison is meaningless
   if (dbResult.status === 'rejected') {
     return {
       status: 'error',
       city,
       events_in_db: null,
       events_seen: null,
+      events_seen_in_db: null,
       alert: true,
-      reason: `DB count query failed: ${dbResult.reason.message}`,
+      reason: `DB query failed: ${dbResult.reason.message}`,
     };
   }
-  const eventsInDb = dbResult.value;
+  const { count: eventsInDb, urls: dbUrls } = dbResult.value;
+  const dbUrlSet = new Set(dbUrls);
 
   const platformEvents = [];
   const fetchErrors = [];
@@ -223,6 +245,7 @@ export async function checkCoverage(city = 'austin') {
       city,
       events_in_db: eventsInDb,
       events_seen: null,
+      events_seen_in_db: null,
       alert: true,
       reason: `All reference platforms failed: ${fetchErrors.join('; ')}`,
     };
@@ -237,12 +260,21 @@ export async function checkCoverage(city = 'austin') {
       city,
       events_in_db: eventsInDb,
       events_seen: null,
+      events_seen_in_db: null,
       alert: true,
       reason: `AI filter failed: ${e.message}`,
     };
   }
 
+  // URL overlap: how many of the platform AI events are in our DB?
+  // The URL set never leaves this function — only the count is returned.
+  let eventsSeenInDb = 0;
+  for (const evt of aiEvents) {
+    if (isInDb(evt.url, dbUrls, dbUrlSet)) eventsSeenInDb++;
+  }
+
   const eventsSeen = aiEvents.length;
+  const eventsMissing = eventsSeen - eventsSeenInDb;
   const partial = fetchErrors.length > 0 ? ` (partial: ${fetchErrors.join('; ')})` : '';
 
   return {
@@ -250,8 +282,9 @@ export async function checkCoverage(city = 'austin') {
     city,
     events_in_db: eventsInDb,
     events_seen: eventsSeen,
+    events_seen_in_db: eventsSeenInDb,
     alert: false,
-    reason: `events_in_db=${eventsInDb}, events_seen=${eventsSeen}${partial}`,
+    reason: `events_in_db=${eventsInDb}, events_seen=${eventsSeen}, events_seen_in_db=${eventsSeenInDb}, missing=${eventsMissing}${partial}`,
   };
 }
 

@@ -24,6 +24,10 @@ async function writeAuditRow(city, liveness, coverage) {
   const supabase = createClient(supabaseUrl, serviceRoleKey);
   const eventsInDb = liveness.events_count;
   const eventsSeen = coverage.events_seen ?? null;
+  const eventsSeenInDb = coverage.events_seen_in_db ?? null;
+  const eventsMissing = (eventsSeen != null && eventsSeenInDb != null)
+    ? eventsSeen - eventsSeenInDb
+    : null;
   // MUST match LOOKAHEAD_DAYS in coverage.js, meetupFind.js, liveness.js.
   const lookaheadDays = 30;
 
@@ -33,9 +37,10 @@ async function writeAuditRow(city, liveness, coverage) {
       city,
       events_in_db: eventsInDb,
       events_seen: eventsSeen,
+      events_seen_in_db: eventsSeenInDb,
       lookahead_days: lookaheadDays,
       liveness_status: liveness.status,
-      notes: `liveness=${liveness.status}, events_in_db=${eventsInDb ?? 'n/a'}, events_seen=${eventsSeen ?? 'n/a'} (next ${lookaheadDays}d)`,
+      notes: `liveness=${liveness.status}, in_db=${eventsInDb ?? 'n/a'}, seen=${eventsSeen ?? 'n/a'}, seen_in_db=${eventsSeenInDb ?? 'n/a'}, missing=${eventsMissing ?? 'n/a'} (next ${lookaheadDays}d)`,
       // Legacy columns intentionally left null — watchdog no longer leaks
       // specific events, per-platform counts, or coverage percentages.
       events_on_luma: null,
@@ -83,10 +88,15 @@ async function runForCity(city) {
 
   try {
     coverage = await checkCoverage(city);
+    const missing = (coverage.events_seen != null && coverage.events_seen_in_db != null)
+      ? coverage.events_seen - coverage.events_seen_in_db
+      : 'n/a';
     console.log('Coverage check:');
     console.log(`   Status:    ${coverage.status}`);
-    console.log(`   DB:        ${coverage.events_in_db ?? 'n/a'}`);
+    console.log(`   In DB:     ${coverage.events_in_db ?? 'n/a'}`);
     console.log(`   Seen:      ${coverage.events_seen ?? 'n/a'}`);
+    console.log(`   In both:   ${coverage.events_seen_in_db ?? 'n/a'}`);
+    console.log(`   Missing:   ${missing}`);
     console.log(`   Reason:    ${coverage.reason}`);
     if (coverage.alert) {
       console.error(`\n   ⚠️  COVERAGE ALERT`);
