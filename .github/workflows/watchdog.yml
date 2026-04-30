@@ -37,9 +37,9 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ALERT_THRESHOLD_EVENTS: ${{ secrets.ALERT_THRESHOLD_EVENTS || '5' }}
           WATCHDOG_DISABLED: ${{ secrets.WATCHDOG_DISABLED || '0' }}
-          # Comma-separated list of city slugs to check. Each must have a Luma
-          # reference URL configured in scripts/coverage.js (CITY_LUMA_URLS).
-          WATCHDOG_CITIES: ${{ secrets.WATCHDOG_CITIES || 'austin,sf' }}
+          # WATCHDOG_CITIES is no longer set by default — the watchdog auto-detects
+          # active cities from the cities registry. Set the secret only when you
+          # need to scope a run to a specific subset (testing, partial outage).
         run: npm start
 
       - name: Create GH issue on alert
