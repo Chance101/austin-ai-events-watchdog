@@ -11,14 +11,32 @@
 // MUST match LOOKAHEAD_DAYS in coverage.js + liveness.js + run.js writeAuditRow.
 const LOOKAHEAD_DAYS = 30;
 
-function buildFindUrl(stateCode, cityName) {
-  const state = stateCode.toLowerCase();
-  const city = encodeURIComponent(cityName).replace(/%20/g, '+');
-  return `https://www.meetup.com/find/?keywords=AI&location=us--${state}--${city}`;
+/**
+ * Build the Meetup find URL. Shape:
+ *   - US:     us--<state>--<city>     (state required)
+ *   - non-US: <country>--<city>       (no state segment)
+ *
+ * Verified against meetup.com on 2026-04-29:
+ *   us--tx--Austin      → US AI events in Austin, TX
+ *   gb--London          → UK AI events in London (within 18 mi)
+ *
+ * @param {Object} ref
+ * @param {string} ref.country - ISO country code, e.g. 'us', 'gb'
+ * @param {string} [ref.state] - US state code (required when country='us')
+ * @param {string} ref.city - City name (will be URL-encoded)
+ */
+function buildFindUrl({ country, state, city }) {
+  const cc = country.toLowerCase();
+  const cityEnc = encodeURIComponent(city).replace(/%20/g, '+');
+  if (cc === 'us') {
+    if (!state) throw new Error('US Meetup find URL requires a state code');
+    return `https://www.meetup.com/find/?keywords=AI&location=us--${state.toLowerCase()}--${cityEnc}`;
+  }
+  return `https://www.meetup.com/find/?keywords=AI&location=${cc}--${cityEnc}`;
 }
 
-export async function fetchMeetupFindEvents(stateCode, cityName) {
-  const url = buildFindUrl(stateCode, cityName);
+export async function fetchMeetupFindEvents(ref) {
+  const url = buildFindUrl(ref);
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',

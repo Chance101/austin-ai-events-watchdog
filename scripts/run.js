@@ -41,11 +41,9 @@ async function writeAuditRow(city, liveness, coverage) {
       lookahead_days: lookaheadDays,
       liveness_status: liveness.status,
       notes: `liveness=${liveness.status}, in_db=${eventsInDb ?? 'n/a'}, seen=${eventsSeen ?? 'n/a'}, seen_in_db=${eventsSeenInDb ?? 'n/a'}, missing=${eventsMissing ?? 'n/a'} (next ${lookaheadDays}d)`,
-      // Legacy columns intentionally left null — watchdog no longer leaks
-      // specific events, per-platform counts, or coverage percentages.
-      events_on_luma: null,
-      coverage_percentage: null,
-      gap_event_titles: null,
+      // Legacy columns (events_on_luma, coverage_percentage, gap_event_titles)
+      // were dropped during the count-only reset and are no longer written.
+      // The principle is enforced structurally by their absence from the schema.
     });
 
   if (error) {
@@ -59,7 +57,8 @@ async function writeAuditRow(city, liveness, coverage) {
   return { written: true };
 }
 
-async function runForCity(city) {
+async function runForCity(cityRow) {
+  const city = cityRow.slug;
   console.log(`\n${'='.repeat(50)}`);
   console.log(`🐕 Watchdog: city=${city}`);
   console.log('='.repeat(50));
@@ -87,7 +86,7 @@ async function runForCity(city) {
   console.log();
 
   try {
-    coverage = await checkCoverage(city);
+    coverage = await checkCoverage(cityRow);
     const missing = (coverage.events_seen != null && coverage.events_seen_in_db != null)
       ? coverage.events_seen - coverage.events_seen_in_db
       : 'n/a';
@@ -116,6 +115,29 @@ async function runForCity(city) {
   return exitCode;
 }
 
+/**
+ * Auto-detect the cities to watch by querying the global `cities` registry.
+ * Includes any city with status='active' or status='beta'.
+ *
+ * Independence note: this is a one-way read. The watchdog never writes back
+ * to the cities table — see project_watchdog_independence_from_bootstrap.md.
+ */
+async function loadActiveCities() {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !key) {
+    throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY (or SERVICE_ROLE_KEY) are required');
+  }
+  const supabase = createClient(supabaseUrl, key);
+  const { data, error } = await supabase
+    .from('cities')
+    .select('slug, name, full_name, country, status')
+    .in('status', ['beta', 'active'])
+    .order('slug');
+  if (error) throw new Error(`Failed to load cities: ${error.message}`);
+  return data || [];
+}
+
 async function main() {
   if (process.env.WATCHDOG_DISABLED === '1') {
     console.log('🔒 WATCHDOG_DISABLED=1 — skipping all checks.');
@@ -125,16 +147,38 @@ async function main() {
   console.log('🐕 austin-ai-events-watchdog running');
   console.log(`   Time: ${new Date().toISOString()}`);
 
-  const citiesEnv = process.env.WATCHDOG_CITIES || 'austin';
-  const cities = citiesEnv.split(',').map(s => s.trim()).filter(Boolean);
+  // Auto-detect from the cities registry. WATCHDOG_CITIES env stays as an
+  // explicit override (filter the auto-detected set to just those slugs)
+  // for testing or scoped runs.
+  let cityRows;
+  try {
+    const allActive = await loadActiveCities();
+    const overrideEnv = process.env.WATCHDOG_CITIES;
+    if (overrideEnv) {
+      const slugs = overrideEnv.split(',').map(s => s.trim()).filter(Boolean);
+      cityRows = allActive.filter(c => slugs.includes(c.slug));
+      console.log(`   Override: WATCHDOG_CITIES=${overrideEnv} → ${cityRows.length} cities`);
+    } else {
+      cityRows = allActive;
+      console.log(`   Auto-detected ${cityRows.length} active cities: ${cityRows.map(c => c.slug).join(', ')}`);
+    }
+  } catch (e) {
+    console.error(`💥 Failed to auto-detect cities: ${e.message}`);
+    process.exit(2);
+  }
+
+  if (cityRows.length === 0) {
+    console.log('🐕 No active cities to watch — exiting.');
+    process.exit(0);
+  }
 
   let maxExit = 0;
-  for (const city of cities) {
-    const code = await runForCity(city);
+  for (const cityRow of cityRows) {
+    const code = await runForCity(cityRow);
     maxExit = Math.max(maxExit, code);
   }
 
-  console.log(`\n🐕 Watchdog exit: ${maxExit} (checked ${cities.length} cities)`);
+  console.log(`\n🐕 Watchdog exit: ${maxExit} (checked ${cityRows.length} cities)`);
   process.exit(maxExit);
 }
 

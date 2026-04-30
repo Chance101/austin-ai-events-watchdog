@@ -23,23 +23,41 @@ import { fetchMeetupFindEvents } from './meetupFind.js';
 // 30 = match the frontend calendar window (what users actually see).
 const LOOKAHEAD_DAYS = 30;
 
-// Per-city watchdog references. Luma city aggregator + Meetup find search.
-// Both must be strict supersets of the city's config sources — never
-// config sources themselves — otherwise the comparison is circular.
-//
-// luma.com/<slug> is the natural city aggregator (noisy, AI filter handles
-// it). Meetup find is a topic+city search across all groups, also a
-// strict superset by construction.
-const CITY_REFERENCES = {
-  austin: {
-    luma_url: 'https://luma.com/austin',
-    meetup_find: { state: 'tx', city: 'Austin' },
-  },
-  sf: {
-    luma_url: 'https://luma.com/sf',
-    meetup_find: { state: 'ca', city: 'San Francisco' },
-  },
-};
+/**
+ * Derive watchdog references from a row in the cities table.
+ *
+ * Reference design principle: both refs must be strict supersets of the
+ * city's config sources — never config sources themselves — otherwise
+ * the comparison is circular.
+ *
+ * - Luma URL: convention is luma.com/<slug>, the city's aggregator page.
+ *   Noisy (general events, not AI-only); the AI filter handles it.
+ * - Meetup find: topic+city search across all groups, a strict superset
+ *   of any specific Meetup group config source. Country-aware: US uses
+ *   state segment, non-US uses bare country code.
+ *
+ * Independence: this derivation lives in the watchdog. The bootstrap-city
+ * skill writes only to cities/sources/templates and never touches the
+ * watchdog's config — see project_watchdog_independence_from_bootstrap.md.
+ *
+ * @param {Object} cityRow - { slug, country, full_name } from cities table
+ */
+function deriveReference(cityRow) {
+  const { slug, country, full_name } = cityRow;
+  const luma_url = `https://luma.com/${slug}`;
+
+  // Parse "City, ST" or "City, UK" — last comma separates city from regional code.
+  const lastComma = full_name.lastIndexOf(',');
+  const cityName = lastComma > -1 ? full_name.slice(0, lastComma).trim() : full_name;
+  const regionCode = lastComma > -1 ? full_name.slice(lastComma + 1).trim() : '';
+
+  const cc = (country || 'US').toLowerCase();
+  const meetup_find = cc === 'us'
+    ? { country: 'us', state: regionCode.toLowerCase(), city: cityName }
+    : { country: cc, city: cityName };
+
+  return { luma_url, meetup_find };
+}
 
 /**
  * Filter a combined list of events to AI-related ones via a single Haiku call.
@@ -192,9 +210,17 @@ function isInDb(eventUrl, dbUrls, dbUrlSet) {
   return false;
 }
 
-export async function checkCoverage(city = 'austin') {
-  const ref = CITY_REFERENCES[city];
-  if (!ref) {
+/**
+ * @param {Object} cityRow - row from cities table: { slug, country, full_name }.
+ *   Pass the full row rather than a slug so the function can derive its
+ *   reference URLs without re-querying the DB.
+ */
+export async function checkCoverage(cityRow) {
+  const city = cityRow.slug;
+  let ref;
+  try {
+    ref = deriveReference(cityRow);
+  } catch (e) {
     return {
       status: 'error',
       city,
@@ -202,13 +228,13 @@ export async function checkCoverage(city = 'austin') {
       events_seen: null,
       events_seen_in_db: null,
       alert: true,
-      reason: `No CITY_REFERENCES entry for city=${city}`,
+      reason: `Failed to derive reference: ${e.message}`,
     };
   }
 
   const [lumaResult, meetupResult, dbResult] = await Promise.allSettled([
     fetchLumaEvents(ref.luma_url),
-    fetchMeetupFindEvents(ref.meetup_find.state, ref.meetup_find.city),
+    fetchMeetupFindEvents(ref.meetup_find),
     fetchOurEvents(city),
   ]);
 
